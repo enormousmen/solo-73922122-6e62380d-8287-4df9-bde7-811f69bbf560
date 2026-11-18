@@ -45,6 +45,13 @@ from .checkpoint import (
 )
 from .config import TrainConfig
 from .dataset import load_classification_csv
+from .drift import (
+    DriftBaseline,
+    PSI_ALERT_THRESHOLD,
+    build_drift_baseline,
+    hash_dataset_file,
+    score_drift,
+)
 from .model import build_model
 
 
@@ -71,6 +78,10 @@ class PauseTimeoutError(Exception):
 
 class CheckpointSaveError(Exception):
     """500 - pause could not persist a complete checkpoint."""
+
+
+class DriftUnavailableError(Exception):
+    """404 - no published drift baseline exists yet."""
 
 
 def epoch_permutation(seed: int, epoch: int, n: int) -> list[int]:
@@ -128,6 +139,14 @@ class JobManager:
         self.started_at: str | None = None
         self._saved_point: tuple[int, int] | None = None
         self._resume_rng_state = None
+        # Drift baseline lifecycle:
+        #   _drift_baseline  : immutable baseline built from the currently
+        #                      loaded CSV (pending or published)
+        #   _drift_published : True only once it has ridden a successfully
+        #                      persisted checkpoint; on recovery it is loaded
+        #                      from the checkpoint and never recomputed.
+        self._drift_baseline: DriftBaseline | None = None
+        self._drift_published = False
 
     def _load_dataset(self) -> None:
         path = self.default_config.dataset_path
@@ -136,6 +155,9 @@ class JobManager:
         self.input_dim = int(self.X.shape[1])
         self.num_classes = int(self.y.max().item()) + 1
         self.dataset_path = path
+        # Snapshot of the on-disk CSV content at process start; used to flag
+        # rewrites relative to the baseline stored in the checkpoint.
+        self.dataset_sha256 = hash_dataset_file(path)
 
     def _build_training_objects(self) -> None:
         self.model = build_model(self.input_dim, self.cfg.hidden_dim,
@@ -162,6 +184,13 @@ class JobManager:
         self.run_id = ckpt["run_id"]
         self.started_at = ckpt.get("started_at")
         self._saved_point = (self.epoch, self.next_batch)
+        # The drift baseline is restored verbatim from the checkpoint.  It is
+        # deliberately NOT recomputed from the CSV on disk, so rewriting the
+        # CSV can never silently change a historical baseline.
+        drift_data = ckpt.get("drift_baseline")
+        if drift_data is not None:
+            self._drift_baseline = DriftBaseline.from_dict(drift_data)
+            self._drift_published = True
         try:
             mtime = checkpoint_path(self.runs_dir).stat().st_mtime
             self.last_checkpoint_at = datetime.fromtimestamp(
@@ -194,6 +223,13 @@ class JobManager:
             self._build_training_objects()
             self.run_id = uuid.uuid4().hex[:12]
             self.started_at = _now_iso()
+            # Build the drift baseline from the CSV actually loaded for this
+            # run.  It stays "pending" until the first successful checkpoint
+            # save carries it to disk; a force-restart before that point has
+            # no published baseline to serve.
+            self._drift_baseline = build_drift_baseline(
+                self.X, self.feature_cols, self.dataset_path, self.run_id)
+            self._drift_published = False
             # A fresh run replaces any previous checkpoint on disk.
             checkpoint_path(self.runs_dir).unlink(missing_ok=True)
             self.state = JobState.RUNNING
@@ -360,6 +396,11 @@ class JobManager:
             "rng_state": torch.get_rng_state(),
             "started_at": self.started_at,
             "saved_at": _now_iso(),
+            # The baseline rides along with every successful checkpoint, so
+            # recovery never needs the (possibly rewritten) CSV to rebuild it.
+            "drift_baseline": (
+                self._drift_baseline.to_dict()
+                if self._drift_baseline is not None else None),
         }
         with self._save_lock:
             if not force and not self.checkpoint_dirty and self._saved_point == point:
@@ -382,6 +423,9 @@ class JobManager:
                 self.last_error = None
                 self._saved_point = point
                 self.last_checkpoint_at = _now_iso()
+                # The checkpoint containing the baseline is now durable.
+                if self._drift_baseline is not None:
+                    self._drift_published = True
 
     # ----------------------------------------------------------------- queries
 
@@ -408,6 +452,9 @@ class JobManager:
                 "last_checkpoint_at": self.last_checkpoint_at,
                 "last_error": self.last_error,
                 "started_at": self.started_at,
+                "drift_baseline_available": self._drift_published,
+                "drift_baseline_run_id": (
+                    self._drift_baseline.run_id if self._drift_published else None),
                 "config": self.cfg.to_dict() if self.cfg else None,
                 "dataset": {
                     "path": self.dataset_path,
@@ -441,3 +488,92 @@ class JobManager:
         if not path.exists():
             raise NotFoundError("no checkpoint exists yet; train first")
         return path
+
+    # ------------------------------------------------------------------- drift
+
+    def _drift_snapshot_locked(
+        self,
+    ) -> tuple[DriftBaseline, int, int, int, str] | None:
+        """Return the published baseline plus its checkpoint position.
+
+        Callers must hold ``self._cond``.  The returned baseline object is
+        immutable, so it can be used after the lock is released even if a
+        ``force`` start swaps the run underneath the in-flight request.  The
+        position is captured here too, because after a swap ``self.cfg``
+        would describe the new run rather than the baseline run.
+        """
+        if not self._drift_published or self._drift_baseline is None:
+            return None
+        saved_epoch, saved_next_batch = (
+            self._saved_point if self._saved_point is not None
+            else (self.epoch, self.next_batch))
+        if self.cfg is not None:
+            bpe = (self.num_samples + self.cfg.batch_size - 1) // self.cfg.batch_size
+        else:
+            bpe = 0
+        completed_batches = saved_epoch * bpe + saved_next_batch
+        return (self._drift_baseline, int(saved_epoch),
+                int(saved_next_batch), int(completed_batches),
+                self.last_checkpoint_at or "")
+
+    def compute_drift(self, samples: list[list[float]]) -> dict:
+        """Score one incoming batch against the published drift baseline.
+
+        Only a short lock is taken to snapshot the immutable baseline; the
+        numeric work runs lock-free, so neither the trainer thread nor status
+        queries are blocked.  If the run changes after the snapshot was taken
+        (e.g. a ``force`` restart), the report is still completed with the
+        old ``run_id`` and explicitly marked ``baseline_stale=true``.
+        """
+        with self._cond:
+            snapshot = self._drift_snapshot_locked()
+            current_run_id = self.run_id
+            current_state = self.state.value
+            current_csv_sha256 = self.dataset_sha256
+        if snapshot is None:
+            if self.run_id is None:
+                reason = (
+                    "no drift baseline available: no checkpoint has been "
+                    "persisted yet; start a training run and wait for its "
+                    "first successful checkpoint")
+            else:
+                reason = (
+                    "no drift baseline available: this run has not persisted "
+                    "a checkpoint yet; the baseline is saved together with "
+                    "the first successful checkpoint")
+            raise DriftUnavailableError(reason)
+
+        baseline, saved_epoch, saved_next_batch, saved_completed, saved_at = snapshot
+        if len(samples[0]) != baseline.num_features:
+            raise ValueError(
+                f"each sample must have {baseline.num_features} feature values "
+                f"in training-CSV column order {list(baseline.feature_columns)}; "
+                f"got {len(samples[0])}")
+
+        report = score_drift(baseline, samples)
+
+        with self._cond:
+            run_swapped = self.run_id != current_run_id
+            stale = run_swapped or self._drift_baseline is not baseline
+        report["baseline"] = {
+            "run_id": baseline.run_id,
+            "saved_epoch": saved_epoch,
+            "saved_next_batch": saved_next_batch,
+            "saved_completed_batches": saved_completed,
+            "saved_at": saved_at,
+            "feature_columns": list(baseline.feature_columns),
+            "dataset_path": baseline.dataset_path,
+            "dataset_num_samples": baseline.dataset_num_samples,
+            "dataset_sha256": baseline.dataset_sha256,
+            "dataset_signature_matches_current": (
+                baseline.dataset_sha256 == current_csv_sha256),
+            "current_run_id": current_run_id,
+            "current_state": current_state,
+            "baseline_stale": bool(stale),
+            "stale_reason": (
+                "the run changed after this request read the baseline; "
+                "the report below was still computed against the old run_id "
+                "and is complete" if stale else None),
+        }
+        report["psi_threshold"] = PSI_ALERT_THRESHOLD
+        return report

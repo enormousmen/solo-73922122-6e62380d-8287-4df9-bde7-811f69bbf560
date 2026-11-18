@@ -14,8 +14,9 @@ FastAPI + CPU 版 PyTorch 实现的**单作业训练服务**。训练工程师�
 ```
 app/
   main.py        # FastAPI 入口（/docs 自动生成）
-  trainer.py     # 单作业状态机 + 确定性训练循环 + 暂停/续训
+  trainer.py     # 单作业状态机 + 确定性训练循环 + 暂停/续训 + 漂移基线生命周期
   checkpoint.py  # 原子检查点读写（tmp + fsync + rename）
+  drift.py       # 五分位桶 + PSI 计算 + 不可变漂移基线（随检查点持久化）
   config.py      # 默认配置加载与校验
   dataset.py     # 固定 CSV 数据集加载
   model.py       # 两层 FC + Dropout
@@ -23,6 +24,7 @@ config/default.json      # 默认训练配置
 data/classification.csv  # 固定分类数据集（scripts/generate_data.py 生成）
 scripts/generate_data.py # 数据集生成脚本（固定种子，仅作溯源）
 scripts/verify_repro.py  # 端到端验证：不中断对照 / 暂停续训 / 强退恢复 等
+scripts/verify_drift.py  # 漂移接口端到端验证：PSI 数学 / 基线持久化 / 换作业 / 不阻塞
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -58,6 +60,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/train/losses` | 逐批损失（支持 `since_step`、`limit`） |
 | GET | `/train/parameters` | 下载当前模型参数（.pt，取自最近持久化检查点） |
 | GET | `/train/checkpoint` | 下载完整检查点（模型+优化器+RNG+历史） |
+| POST | `/train/drift` | 线上无标签批次的 PSI 分布漂移评分（20～200 行，按训练 CSV 列序） |
 
 交互式文档（Swagger UI）在 `/docs`，可直接在浏览器里调通上述接口。
 
@@ -84,6 +87,58 @@ curl -X POST localhost:8000/train/resume
 curl -OJ localhost:8000/train/parameters     # model_parameters.pt
 curl -OJ localhost:8000/train/checkpoint     # checkpoint.pt
 ```
+
+### 分布漂移检测（POST /train/drift）
+
+线上拿到无标签样本后，用 PSI（Population Stability Index）判断输入是否已
+偏离该作业训练时的分布。请求体为 20～200 条**有限数值向量**，每条严格按训练
+CSV 的特征列顺序排列（本数据集即 `[feature_1, feature_2]`）：
+
+```bash
+curl -X POST localhost:8000/train/drift -H 'Content-Type: application/json' \
+     -d '{"samples": [[0.12, -1.03], [-0.77, 0.44], ... ]}'
+```
+
+计算口径（实现见 `app/drift.py`，逐列独立计算）：
+
+1. **五分位桶**：以该作业实际加载的 CSV 为基线，取每列 20/40/60/80% 分位数
+   作为内部分桶切点；相邻切点重合（离散/常量列）时合并，桶数可少于 5，常量
+   列退化为 1 个兜底桶；两端桶开口，**超出训练观测范围的值自动归入两端桶**。
+2. **平滑归一化**：基线与新批次的各桶计数各自加 `1e-6` 后重新归一化（和为
+   1），空桶因此也得到非零占比，对数始终有定义。
+3. **PSI**：`sum_b (p_new - p_base) * ln(p_new / p_base)`，逐列返回分数；
+   **严格大于 0.2** 的列进入 `alerts`，同时返回每列切点、两侧计数/占比、
+   超范围样本数，以及基线 `run_id`、保存时的 epoch/批次（`saved_*`）。
+
+基线生命周期与不可变性：
+
+- 基线在作业启动时从**当前实际加载的 CSV** 构建，但只处于 pending 状态；
+  它随**第一个成功落盘的检查点**一起持久化后才对外发布（
+  `GET /train/status` 的 `drift_baseline_available` 可见）。
+- 基线对象只含普通 Python 类型，整体存进检查点；重启后**只从检查点还原，
+  绝不根据磁盘上的 CSV 重算**——即使 CSV 已被改写。响应中的
+  `dataset_signature_matches_current`（CSV 的 SHA-256 比对）会显式提示文件
+  是否已被改写，但历史基线与评分保持不变。
+- 无检查点（从未训练）或 `force` 新作业在首个检查点落盘前调用，返回
+  **404** 与结构化原因 `{"error": "drift_baseline_unavailable", ...}`，不
+  返回未持久化的基线。
+- 请求读取基线用的是不可变快照；即使随后 `force` 换了作业，已在处理中的
+  请求仍按**旧 `run_id`** 完成计算，并以 `baseline_stale=true` 与
+  `stale_reason` 标注，不会抛错或阻塞。
+- 评分在 FastAPI 工作线程中进行且只短暂持有状态锁，训练线程与
+  `/train/status` 等查询不会被漂移计算阻塞。
+
+```bash
+# 无可用基线时
+curl -s -X POST localhost:8000/train/drift -H 'Content-Type: application/json' \
+     -d '{"samples": [[0,0],[0,0]]}' | head
+# 404 -> {"detail": {"error": "drift_baseline_unavailable",
+#          "message": "no drift baseline available: ... first successful checkpoint"}}
+```
+
+自动化验证：`python3 scripts/verify_drift.py`（47 项检查，覆盖 PSI 数学与
+独立参考实现交叉校验、入参校验、404 语义、杀进程重启 + CSV 改写不重算、
+换作业旧 `run_id` 完成并标注 stale、高并发下不阻塞训练与状态查询、`/docs`）。
 
 状态机：`idle → running ⇄ pausing → paused → running … → finished`（异常为
 `failed`）。`paused` 表示训练已停、可续训；`checkpoint_dirty=true` 表示内存进度
@@ -144,7 +199,9 @@ curl -s localhost:8000/train/status    # 直至 state=finished
 
 ## 实测结果
 
-（以下为 `python3 scripts/verify_repro.py` 在本仓库环境下的真实输出摘要）
+### 可恢复性（`python3 scripts/verify_repro.py`）
+
+（以下为本仓库环境下的真实输出摘要）
 
 ```
     workdir: /tmp/verify-repro-ndor_el1
@@ -218,6 +275,38 @@ curl -s localhost:8000/train/status    # 直至 state=finished
 
 ```
 
+### 漂移检测（`python3 scripts/verify_drift.py`）
+
+```
+    == M: quantile bucket + PSI math ==              13/13 PASS
+      五分位切点 / 重合边界合并 / 常量列兜底桶 / 范围外归入两端桶 /
+      1e-6 平滑归一化 / PSI 公式与独立参考实现逐位一致
+    == S: 换作业后在途请求仍按旧 run_id 完成          3/3  PASS
+      baseline_stale=true 显式标注；新作业存点前明确 404
+    == U: 无可用基线                                  3/3  PASS
+      从未训练 / force 新作业首存前 -> 404 结构化原因；存点后状态翻转
+    == V: 请求校验                                    7/7  PASS
+      20~200 行边界、NaN/Inf（422 且错误体 JSON 安全）、异形行、列宽不符
+    == D: HTTP 漂移评分                               7/7  PASS
+      同分布不告警 / 偏移双列告警 / 严格 >0.2 / 20 与 200 行边界
+    == N: 不阻塞训练与状态查询                        3/3  PASS
+      3 路并发漂移 + 训练中，status p95 约 10ms，训练完整跑完
+    == N-lock: 锁内仅做基线快照                       1/1  PASS
+      50 次漂移共 100 个临界区，单次持锁最大约 0.015ms，评分完全在锁外
+    == H: /docs 与 OpenAPI                            2/2  PASS
+    == S-HTTP: force 换作业的在途请求语义             3/3  PASS
+      首存前 404 不复活旧基线；新作业发布后按新 run_id 服务且不标 stale
+    == P: 基线随检查点持久化、抗 CSV 改写             5/5  PASS
+      杀进程重启后 run_id 与切点不变；改写 CSV 不重算，仅签名标记不一致
+
+    ================ SUMMARY ================
+      47/47 checks passed
+```
+
+自动化验证：`python3 scripts/verify_drift.py`（47 项检查，覆盖 PSI 数学与
+独立参考实现交叉校验、入参校验、404 语义、杀进程重启 + CSV 改写不重算、
+换作业旧 `run_id` 完成并标注 stale、高并发下不阻塞训练与状态查询、`/docs`）。
+
 ## 限制与未完成事项
 
 - 单作业、单进程、单 worker：多副本/多 worker 部署会破坏单训练者语义（需引入
@@ -229,6 +318,11 @@ curl -s localhost:8000/train/status    # 直至 state=finished
   避免"已丢弃的旧运行"在重启后被悄悄恢复。
 - `GET /train/parameters` 取自最近**已持久化**检查点，运行中可能落后最多
   `checkpoint_every` 批；未提供"当前内存参数"下载（避免与训练线程竞争）。
+- 漂移基线与检查点同生命周期：`force=true` 丢弃旧检查点的同时旧基线也一并
+  失效，新作业在首个成功检查点落盘前 `/train/drift` 明确返回 404；这是与
+  "旧运行不得被悄悄恢复"一致的刻意语义。
+- 漂移分桶基于 numpy 线性分位数；离散列在切点重合时会产生空桶（由 `1e-6`
+  平滑兜底），常量列只有一个兜底桶、PSI 恒为 0（无法识别常量列内部的漂移）。
 - 本环境无 docker，镜像构建与 compose 未实际执行；Dockerfile/compose 与本地实
   测使用完全相同的启动命令与依赖版本，但未在真实 Docker 中跑过验证脚本。
 - 暂停等待上限为 `pause_timeout_seconds`（默认 30s），超时返回 504，训练仍会
